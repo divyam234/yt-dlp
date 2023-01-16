@@ -177,72 +177,81 @@ class HotStarIE(HotStarBaseIE):
         geo_restricted = False
         formats, subs = [], {}
         headers = {'Referer': f'{self._BASE_URL}/in'}
-
         # change to v2 in the future
         playback_sets = self._call_api_v2('play/v1/playback', video_id, st=st, cookies=cookies)['playBackSets']
-        for playback_set in playback_sets:
-            if not isinstance(playback_set, dict):
-                continue
-            tags = str_or_none(playback_set.get('tagsCombination')) or ''
-            if any(f'{prefix}:{ignore}' in tags
-                   for key, prefix in self._IGNORE_MAP.items()
-                   for ignore in self._configuration_arg(key)):
-                continue
-            tag_dict = dict((t.split(':', 1) + [None])[:2] for t in tags.split(';'))
+        playback_sets = [dict(
+            **x,
+            tags=dict(y.split(":") for y in x["tagsCombination"].lower().split(";"))
+        ) for x in playback_sets]
+        self.res = self._configuration_arg('res',['fhd'])[0]
+        self.vcodec = self._configuration_arg('vcodec',['h264'])[0] 
+        self.acodec = self._configuration_arg('acodec',['aac'])[0] 
+        self.channel = self._configuration_arg('channel',['2.0'])[0]
+        self.dr = self._configuration_arg('dr',['sdr'])[0] 
+        playback_set = next((
+            x for x in playback_sets if
+            x["tags"].get("encryption") == "plain" and
+            x["tags"].get("package") == "dash" and 
+            x["tags"].get("container") == "fmp4br" and
+            x["tags"].get("ladder") == "tv" and
+            x["tags"].get("video_codec") == self.vcodec and  # dvh265, h265, h264 - vp9?
+            x["tags"].get("resolution") == self.res and
+            x["tags"].get("dynamic_range") == self.dr and  # dv, hdr10, sdr - hdr10+?
+            x["tags"].get("audio_codec") == self.acodec and  # ec3, aac - atmos?
+            x["tags"].get("audio_channel") in [{"5.1": "dolby51", "2.0": "stereo"}[self.channel]]
+        ), None)
+        if not playback_set:
+            raise ExtractorError('Wanted playback set is unavailable change values', expected=True)
 
-            format_url = url_or_none(playback_set.get('playbackUrl'))
-            if not format_url:
-                continue
-            format_url = re.sub(r'(?<=//staragvod)(\d)', r'web\1', format_url)
-            ext = determine_ext(format_url)
+        tags = str_or_none(playback_set.get('tagsCombination')) or ''
+        tag_dict = dict((t.split(':', 1) + [None])[:2] for t in tags.split(';'))
+        format_url = url_or_none(playback_set.get('playbackUrl'))
+        format_url = re.sub(r'(?<=//staragvod)(\d)', r'web\1', format_url)
+        ext = determine_ext(format_url)
+        current_formats, current_subs = [], {}
+        try:
+            if 'package:hls' in tags or ext == 'm3u8':
+                current_formats, current_subs = self._extract_m3u8_formats_and_subtitles(
+                    format_url, video_id, ext='mp4', headers=headers)
+            elif 'package:dash' in tags or ext == 'mpd':
+                current_formats, current_subs = self._extract_mpd_formats_and_subtitles(
+                    format_url, video_id, headers=headers)
+            elif ext == 'f4m':
+                pass  # XXX: produce broken files
+            else:
+                current_formats = [{
+                    'url': format_url,
+                    'width': int_or_none(playback_set.get('width')),
+                    'height': int_or_none(playback_set.get('height')),
+                }]
+        except ExtractorError as e:
+            if isinstance(e.cause, compat_HTTPError) and e.cause.code == 403:
+                geo_restricted = True
 
-            current_formats, current_subs = [], {}
-            try:
-                if 'package:hls' in tags or ext == 'm3u8':
-                    current_formats, current_subs = self._extract_m3u8_formats_and_subtitles(
-                        format_url, video_id, ext='mp4', headers=headers)
-                elif 'package:dash' in tags or ext == 'mpd':
-                    current_formats, current_subs = self._extract_mpd_formats_and_subtitles(
-                        format_url, video_id, headers=headers)
-                elif ext == 'f4m':
-                    pass  # XXX: produce broken files
-                else:
-                    current_formats = [{
-                        'url': format_url,
-                        'width': int_or_none(playback_set.get('width')),
-                        'height': int_or_none(playback_set.get('height')),
-                    }]
-            except ExtractorError as e:
-                if isinstance(e.cause, compat_HTTPError) and e.cause.code == 403:
-                    geo_restricted = True
-                continue
-
-            if tag_dict.get('encryption') not in ('plain', None):
-                for f in current_formats:
-                    f['has_drm'] = True
+        if tag_dict.get('encryption') not in ('plain', None):
             for f in current_formats:
-                for k, v in self._TAG_FIELDS.items():
-                    if not f.get(k):
-                        f[k] = tag_dict.get(v)
-                if f.get('vcodec') != 'none' and not f.get('dynamic_range'):
-                    f['dynamic_range'] = tag_dict.get('dynamic_range')
-                if f.get('acodec') != 'none' and not f.get('audio_channels'):
-                    f['audio_channels'] = {
-                        'stereo': 2,
-                        'dolby51': 6,
-                    }.get(tag_dict.get('audio_channel'))
-                f['format_note'] = join_nonempty(
-                    tag_dict.get('ladder'),
-                    tag_dict.get('audio_channel') if f.get('acodec') != 'none' else None,
-                    f.get('format_note'),
-                    delim=', ')
-
-            formats.extend(current_formats)
-            subs = self._merge_subtitles(subs, current_subs)
+                f['has_drm'] = True
+        for f in current_formats:
+            for k, v in self._TAG_FIELDS.items():
+                if not f.get(k):
+                    f[k] = tag_dict.get(v)
+            if f.get('vcodec') != 'none' and not f.get('dynamic_range'):
+                f['dynamic_range'] = tag_dict.get('dynamic_range')
+            if f.get('acodec') != 'none' and not f.get('audio_channels'):
+                f['audio_channels'] = {
+                    'stereo': 2,
+                    'dolby51': 6,
+                }.get(tag_dict.get('audio_channel'))
+            f['format_note'] = join_nonempty(
+                tag_dict.get('ladder'),
+                tag_dict.get('audio_channel') if f.get('acodec') != 'none' else None,
+                f.get('format_note'),
+                delim=', ')
+        formats.extend(current_formats)
+        subs = self._merge_subtitles(subs, current_subs)
 
         if not formats and geo_restricted:
             self.raise_geo_restricted(countries=['IN'], metadata_available=True)
-        self._remove_duplicate_formats(formats)
         for f in formats:
             f.setdefault('http_headers', {}).update(headers)
 
